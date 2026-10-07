@@ -1065,6 +1065,41 @@ button:not(:disabled),
   font-size: 8px;
 }
 
+.asset-treatment-control {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+}
+
+.asset-treatment-label,
+.jpeg-encoder-control > label,
+.photo-resolution-control > label {
+  color: var(--foreground);
+  font-size: 9px;
+  font-weight: 550;
+}
+
+.asset-treatment-control p,
+.photo-resolution-control p {
+  max-width: 520px;
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 8px;
+  line-height: 1.5;
+}
+
+.image-profile-options {
+  width: fit-content;
+  gap: 4px;
+}
+
+.image-profile-options [data-slot="toggle-group-item"] {
+  min-height: 29px;
+  padding: 5px 9px;
+  font-size: 9px;
+}
+
 .asset-expanded-actions {
   display: flex;
   align-items: center;
@@ -1241,13 +1276,18 @@ button:not(:disabled),
 
 .asset-quality-controls {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
   gap: 9px 13px;
 }
 
 .asset-quality-controls .quality-heading,
 .asset-quality-controls > p {
+  grid-column: 1 / -1;
+}
+
+.asset-quality-controls > .jpeg-encoder-control,
+.asset-quality-controls > .photo-resolution-control {
   grid-column: 1 / -1;
 }
 
@@ -1263,6 +1303,55 @@ button:not(:disabled),
 }
 
 .asset-quality-controls > button {
+  justify-self: start;
+  white-space: nowrap;
+}
+
+.jpeg-encoder-control,
+.photo-resolution-control {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.jpeg-encoder-options,
+.photo-resolution-options {
+  width: 100%;
+  gap: 5px;
+}
+
+.jpeg-encoder-options [data-slot="toggle-group-item"] {
+  display: flex;
+  min-width: 0;
+  min-height: 38px;
+  flex: 1 1 0;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  text-align: left;
+}
+
+.jpeg-encoder-options [data-slot="toggle-group-item"] span {
+  font-size: 9px;
+  font-weight: 550;
+}
+
+.jpeg-encoder-options [data-slot="toggle-group-item"] small {
+  color: var(--muted-foreground);
+  font-size: 7px;
+  font-weight: 400;
+}
+
+.photo-resolution-options [data-slot="toggle-group-item"] {
+  min-width: 0;
+  min-height: 30px;
+  flex: 1 1 0;
+  padding: 4px 6px;
+  font-size: 8px;
   white-space: nowrap;
 }
 

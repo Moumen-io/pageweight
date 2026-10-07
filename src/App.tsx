@@ -22,6 +22,7 @@ import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist"
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url"
 import type { AssetCategory, PdfAsset, PdfReport } from "@/lib/pdf-analysis"
 import type { OptimizedPdfImage, PdfImageAsset } from "@/lib/pdf-optimization"
+import type { JpegContentProfile, JpegEncoder } from "@/lib/jpeg-encoding"
 import { convertImage, type ConvertedImage, type OutputFormat } from "@/lib/image-conversion"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -70,9 +71,21 @@ import { cn } from "cn"
 type ToolMode = "inspect" | "convert"
 type AssetFilter = "all" | AssetCategory
 const formatOptions: { value: OutputFormat; label: string; detail: string }[] = [
+  { value: "image/avif", label: "AVIF", detail: "Compact photos" },
   { value: "image/webp", label: "WebP", detail: "Best balance" },
   { value: "image/jpeg", label: "JPEG", detail: "Smaller photos" },
   { value: "image/png", label: "PNG", detail: "Lossless" },
+]
+
+const jpegEncoderOptions: { value: JpegEncoder; label: string; detail: string }[] = [
+  { value: "mozjpeg", label: "MozJPEG", detail: "Smaller files" },
+  { value: "browser", label: "Browser", detail: "Native encoder" },
+]
+
+const photoDimensionOptions: { value: string; label: string }[] = [
+  { value: "2200", label: "2,200 px max" },
+  { value: "1600", label: "1,600 px max" },
+  { value: "original", label: "Original size" },
 ]
 
 const filterOptions: { value: AssetFilter; label: string }[] = [
@@ -141,6 +154,8 @@ function assetIcon(category: AssetCategory) {
 }
 
 const DEFAULT_JPEG_QUALITY = 74
+const DEFAULT_JPEG_ENCODER: JpegEncoder = "mozjpeg"
+const DEFAULT_PHOTO_MAX_DIMENSION = 2200
 
 function AssetTable({
   assets,
@@ -162,6 +177,9 @@ function AssetTable({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
   const [quality, setQuality] = useState(DEFAULT_JPEG_QUALITY)
   const [draftQuality, setDraftQuality] = useState(DEFAULT_JPEG_QUALITY)
+  const [jpegEncoder, setJpegEncoder] = useState<JpegEncoder>(DEFAULT_JPEG_ENCODER)
+  const [photoMaxDimension, setPhotoMaxDimension] = useState<number | null>(DEFAULT_PHOTO_MAX_DIMENSION)
+  const [textSensitiveIds, setTextSensitiveIds] = useState<Set<string>>(() => new Set())
   const [optimizedImages, setOptimizedImages] = useState<OptimizedPdfImage[]>([])
   const [isOptimizing, setIsOptimizing] = useState(false)
   const [isApplying, setIsApplying] = useState(false)
@@ -195,8 +213,9 @@ function AssetTable({
   )
   const allOptimizableSelected = optimizableImages.length > 0
     && optimizableImages.every((image) => selectedIds.has(image.id))
+  const estimatedPdfSize = Math.max(0, fileSize - selectedSavings)
   const downloadHint = selectedSavings > 0
-    ? `${formatBytes(selectedSavings)} smaller across selected images`
+    ? `${formatBytes(selectedSavings)} smaller · about ${formatBytes(estimatedPdfSize)} total`
     : isOptimizing
       ? "Updating the selected image estimates"
       : selectedIds.size === 0
@@ -208,7 +227,12 @@ function AssetTable({
     ownedPreviewUrlsRef.current.clear()
   }, [])
 
-  const optimizeImages = useCallback(async (nextQuality: number) => {
+  const optimizeImages = useCallback(async (
+    nextQuality: number,
+    nextEncoder: JpegEncoder,
+    nextTextSensitiveIds: Set<string>,
+    nextPhotoMaxDimension: number | null,
+  ) => {
     const runId = optimizationRunRef.current + 1
     optimizationRunRef.current = runId
     clearOptimizedPreviews()
@@ -230,7 +254,14 @@ function AssetTable({
       for (const [index, image] of optimizableImages.entries()) {
         if (optimizationRunRef.current !== runId) return
         try {
-          const result = await compressPdfImage(image, nextQuality)
+          const contentProfile: JpegContentProfile = nextTextSensitiveIds.has(image.id) ? "text" : "photo"
+          const result = await compressPdfImage(
+            image,
+            nextQuality,
+            nextEncoder,
+            contentProfile,
+            nextPhotoMaxDimension,
+          )
           if (optimizationRunRef.current !== runId) {
             if (result.previewUrl) URL.revokeObjectURL(result.previewUrl)
             return
@@ -259,7 +290,15 @@ function AssetTable({
     setExpandedIds(new Set())
     setSelectedIds(new Set(optimizableImages.map((image) => image.id)))
     setDraftQuality(DEFAULT_JPEG_QUALITY)
-    void optimizeImages(DEFAULT_JPEG_QUALITY)
+    setJpegEncoder(DEFAULT_JPEG_ENCODER)
+    setPhotoMaxDimension(DEFAULT_PHOTO_MAX_DIMENSION)
+    setTextSensitiveIds(new Set())
+    void optimizeImages(
+      DEFAULT_JPEG_QUALITY,
+      DEFAULT_JPEG_ENCODER,
+      new Set(),
+      DEFAULT_PHOTO_MAX_DIMENSION,
+    )
     return () => {
       optimizationRunRef.current += 1
     }
@@ -289,6 +328,14 @@ function AssetTable({
     setSelectedIds(allOptimizableSelected
       ? new Set()
       : new Set(optimizableImages.map((image) => image.id)))
+  }
+
+  const setTextSensitive = (id: string, enabled: boolean) => {
+    const next = new Set(textSensitiveIds)
+    if (enabled) next.add(id)
+    else next.delete(id)
+    setTextSensitiveIds(next)
+    void optimizeImages(quality, jpegEncoder, next, photoMaxDimension)
   }
 
   const downloadOptimizedPdf = async () => {
@@ -360,6 +407,7 @@ function AssetTable({
               const result = optimizedById.get(asset.id)
               const expanded = expandedIds.has(asset.id)
               const selected = selectedIds.has(asset.id)
+              const textSensitive = textSensitiveIds.has(asset.id)
               const detailsId = `asset-details-${asset.id.replace(/[^a-zA-Z0-9_-]/g, "-")}`
               const sizeDelta = result && result.originalBytes > 0
                 ? Math.round(((result.blob.size - result.originalBytes) / result.originalBytes) * 100)
@@ -454,10 +502,39 @@ function AssetTable({
                               <span><small>Encoded</small><strong>{formatBytes(asset.sizeBytes)}</strong></span>
                               <span><small>Optimized at {quality}%</small><strong>{result ? formatBytes(result.blob.size) : isOptimizing && image?.canOptimize ? "Preparing…" : "—"}</strong></span>
                             </div>
+                            {image?.canOptimize && (
+                              <div className="asset-treatment-control">
+                                <span className="asset-treatment-label">Image treatment</span>
+                                <ToggleGroup
+                                  aria-label={`Compression profile for ${asset.name}`}
+                                  className="image-profile-options"
+                                  disabled={isOptimizing || isApplying}
+                                  multiple={false}
+                                  onValueChange={(values) => {
+                                    if (values[0]) setTextSensitive(asset.id, values[0] === "text")
+                                  }}
+                                  value={[textSensitive ? "text" : "photo"]}
+                                  variant="outline"
+                                  size="sm"
+                                >
+                                  <ToggleGroupItem value="photo">Photo</ToggleGroupItem>
+                                  <ToggleGroupItem value="text">Text & detail</ToggleGroupItem>
+                                </ToggleGroup>
+                                <p>
+                                  {textSensitive
+                                    ? jpegEncoder === "mozjpeg"
+                                      ? "Keeps source resolution and uses 4:4:4 color detail with MozJPEG."
+                                      : "Keeps source resolution for text and fine detail."
+                                    : image.hasSoftMask
+                                      ? "Keeps source resolution to preserve the original transparency mask."
+                                      : `Downsamples to ${photoMaxDimension ? `${photoMaxDimension}px max` : "original size"} and prioritizes smaller photos.`}
+                                </p>
+                              </div>
+                            )}
                             {image?.reason && <p className="asset-optimization-reason">{image.reason}</p>}
                             {image?.hasSoftMask && <p className="asset-optimization-reason">Transparency is kept in its original soft mask.</p>}
                             <div className="asset-expanded-actions">
-                              <span>{image?.canOptimize ? "JPEG recompression runs locally in your browser." : "This stream is left unchanged."}</span>
+                              <span>{image?.canOptimize ? `${jpegEncoder === "mozjpeg" ? "MozJPEG" : "Browser JPEG"} recompression runs locally in your browser.` : "This stream is left unchanged."}</span>
                               <Button
                                 disabled={!image?.previewUrl || !result?.previewUrl}
                                 onClick={() => {
@@ -510,9 +587,57 @@ function AssetTable({
               step={1}
               value={[draftQuality]}
             />
+            <div className="jpeg-encoder-control">
+              <Label>JPEG encoder</Label>
+              <ToggleGroup
+                aria-label="PDF JPEG encoder"
+                className="jpeg-encoder-options"
+                disabled={isOptimizing || isApplying || optimizableImages.length === 0}
+                multiple={false}
+                onValueChange={(values) => {
+                  const nextEncoder = values[0] as JpegEncoder | undefined
+                  if (!nextEncoder) return
+                  setJpegEncoder(nextEncoder)
+                  void optimizeImages(quality, nextEncoder, textSensitiveIds, photoMaxDimension)
+                }}
+                value={[jpegEncoder]}
+                variant="outline"
+                size="sm"
+              >
+                {jpegEncoderOptions.map((option) => (
+                  <ToggleGroupItem key={option.value} value={option.value} className="format-option">
+                    <span>{option.label}</span>
+                    <small>{option.detail}</small>
+                  </ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+            </div>
+            <div className="photo-resolution-control">
+              <Label>Photo resolution</Label>
+              <ToggleGroup
+                aria-label="Maximum resolution for photo images"
+                className="photo-resolution-options"
+                disabled={isOptimizing || isApplying || optimizableImages.length === 0}
+                multiple={false}
+                onValueChange={(values) => {
+                  if (!values[0]) return
+                  const nextDimension = values[0] === "original" ? null : Number(values[0])
+                  setPhotoMaxDimension(nextDimension)
+                  void optimizeImages(quality, jpegEncoder, textSensitiveIds, nextDimension)
+                }}
+                value={[photoMaxDimension?.toString() ?? "original"]}
+                variant="outline"
+                size="sm"
+              >
+                {photoDimensionOptions.map((option) => (
+                  <ToggleGroupItem key={option.value} value={option.value}>{option.label}</ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+              <p>Text & detail images keep their original dimensions. Photo images can be downsampled to reduce the PDF further.</p>
+            </div>
             <Button
               disabled={draftQuality === quality || isOptimizing || isApplying || optimizableImages.length === 0}
-              onClick={() => void optimizeImages(draftQuality)}
+              onClick={() => void optimizeImages(draftQuality, jpegEncoder, textSensitiveIds, photoMaxDimension)}
               size="sm"
               variant="outline"
             >
@@ -979,6 +1104,8 @@ function ImageConverter() {
   const [files, setFiles] = useState<File[]>([])
   const [format, setFormat] = useState<OutputFormat>("image/webp")
   const [quality, setQuality] = useState(82)
+  const [jpegEncoder, setJpegEncoder] = useState<JpegEncoder>(DEFAULT_JPEG_ENCODER)
+  const [jpegContentProfile, setJpegContentProfile] = useState<JpegContentProfile>("photo")
   const [results, setResults] = useState<ConvertedImage[]>([])
   const [errors, setErrors] = useState<string[]>([])
   const [isConverting, setIsConverting] = useState(false)
@@ -994,11 +1121,11 @@ function ImageConverter() {
     const rejected: string[] = []
 
     for (const file of incoming) {
-      if (/\.(png|jpe?g|webp)$/i.test(file.name)) accepted.push(file)
+      if (/\.(png|jpe?g|webp|avif)$/i.test(file.name)) accepted.push(file)
       else rejected.push(file.name)
     }
 
-    setErrors(rejected.map((name) => `${name}: choose a PNG, JPEG, or WebP image.`))
+    setErrors(rejected.map((name) => `${name}: choose a PNG, JPEG, WebP, or AVIF image.`))
     if (accepted.length === 0) return
 
     setFiles((previous) => {
@@ -1038,7 +1165,7 @@ function ImageConverter() {
         nextIndex.value += 1
         const file = files[index]
         try {
-          converted[index] = await convertImage(file, format, quality / 100)
+          converted[index] = await convertImage(file, format, quality / 100, jpegEncoder, jpegContentProfile)
         } catch (conversionError) {
           const message = conversionError instanceof Error ? conversionError.message : "Could not convert this image."
           conversionErrors.push(`${file.name}: ${message}`)
@@ -1048,7 +1175,8 @@ function ImageConverter() {
       }
     }
 
-    await Promise.all(Array.from({ length: Math.min(3, files.length) }, () => worker()))
+    const concurrency = format === "image/avif" ? 1 : 3
+    await Promise.all(Array.from({ length: Math.min(concurrency, files.length) }, () => worker()))
     setResults(converted.filter((result): result is ConvertedImage => Boolean(result)))
     setErrors(conversionErrors)
     setIsConverting(false)
@@ -1110,7 +1238,7 @@ function ImageConverter() {
           >
             <input
               ref={inputRef}
-              accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp"
+              accept="image/png,image/jpeg,image/webp,image/avif,.png,.jpg,.jpeg,.webp,.avif"
               className="sr-only"
               multiple
               onChange={handleFiles}
@@ -1119,7 +1247,7 @@ function ImageConverter() {
             <span className="image-drop-icon"><FileImage aria-hidden="true" /></span>
             <div>
               <h3>Drop images here</h3>
-              <p>PNG, JPEG, and WebP · Select as many as you need</p>
+              <p>PNG, JPEG, WebP, and AVIF · Select as many as you need</p>
             </div>
             <Button onClick={() => inputRef.current?.click()} variant="outline">
               <Upload data-icon="inline-start" /> Browse files
@@ -1150,6 +1278,53 @@ function ImageConverter() {
               ))}
             </ToggleGroup>
 
+            {format === "image/jpeg" && (
+              <div className="jpeg-encoder-control">
+                <FieldLabelLine label="JPEG encoder" description="Both choices produce standard JPEG files." />
+                <ToggleGroup
+                  aria-label="Bulk JPEG encoder"
+                  className="jpeg-encoder-options"
+                  multiple={false}
+                  onValueChange={(values) => {
+                    const nextEncoder = values[0] as JpegEncoder | undefined
+                    if (nextEncoder) {
+                      setJpegEncoder(nextEncoder)
+                      setResults([])
+                    }
+                  }}
+                  value={[jpegEncoder]}
+                  variant="outline"
+                  size="sm"
+                >
+                  {jpegEncoderOptions.map((option) => (
+                    <ToggleGroupItem key={option.value} value={option.value} className="format-option">
+                      <span>{option.label}</span>
+                      <small>{option.detail}</small>
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+                <FieldLabelLine label="Image content" description="Text detail keeps full color sampling; photo favors smaller files." />
+                <ToggleGroup
+                  aria-label="JPEG image content profile"
+                  className="image-profile-options"
+                  multiple={false}
+                  onValueChange={(values) => {
+                    const nextProfile = values[0] as JpegContentProfile | undefined
+                    if (nextProfile) {
+                      setJpegContentProfile(nextProfile)
+                      setResults([])
+                    }
+                  }}
+                  value={[jpegContentProfile]}
+                  variant="outline"
+                  size="sm"
+                >
+                  <ToggleGroupItem value="photo">Photo</ToggleGroupItem>
+                  <ToggleGroupItem value="text">Text & detail</ToggleGroupItem>
+                </ToggleGroup>
+              </div>
+            )}
+
             <div className="quality-control">
               <div className="quality-heading">
                 <Label htmlFor="image-quality">Quality</Label>
@@ -1171,7 +1346,7 @@ function ImageConverter() {
                 step={1}
                 value={[quality]}
               />
-              <p>Lower quality creates smaller files. PNG is exported losslessly.</p>
+              <p>{format === "image/png" ? "PNG is exported losslessly." : format === "image/avif" ? "AVIF is compact; encoding may take longer." : "Lower quality creates smaller files. Text & detail mode avoids color subsampling for JPEG."}</p>
             </div>
 
             <Separator />
@@ -1204,7 +1379,7 @@ function ImageConverter() {
           )}
 
           <p className="conversion-note">
-            JPEG has no transparency. Transparent areas are filled with white. Browser conversion removes embedded metadata.
+            JPEG has no transparency; transparent areas are filled with white. WebP and AVIF are standalone image formats and cannot be embedded in a broadly compatible PDF.
           </p>
         </div>
 

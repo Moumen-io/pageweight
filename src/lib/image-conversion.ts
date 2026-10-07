@@ -1,4 +1,6 @@
-export type OutputFormat = "image/webp" | "image/jpeg" | "image/png"
+import { encodeCanvasAsJpeg, type JpegContentProfile, type JpegEncoder } from "@/lib/jpeg-encoding"
+
+export type OutputFormat = "image/avif" | "image/webp" | "image/jpeg" | "image/png"
 
 export type ConvertedImage = {
   id: string
@@ -11,16 +13,18 @@ export type ConvertedImage = {
 }
 
 const extensions: Record<OutputFormat, string> = {
+  "image/avif": "avif",
   "image/webp": "webp",
   "image/jpeg": "jpg",
   "image/png": "png",
 }
 
-function canvasBlob(canvas: HTMLCanvasElement, type: OutputFormat, quality: number) {
+function canvasBlob(canvas: HTMLCanvasElement, type: Exclude<OutputFormat, "image/avif">, quality: number) {
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
       (blob) => {
-        if (blob) resolve(blob)
+        if (blob?.type === type) resolve(blob)
+        else if (blob) reject(new Error(`This browser cannot encode ${type.replace("image/", "")} images.`))
         else reject(new Error("This browser could not encode the selected format."))
       },
       type,
@@ -33,6 +37,8 @@ export async function convertImage(
   source: File,
   format: OutputFormat,
   quality: number,
+  jpegEncoder: JpegEncoder = "mozjpeg",
+  jpegContentProfile: JpegContentProfile = "photo",
 ): Promise<ConvertedImage> {
   const bitmap = await createImageBitmap(source)
 
@@ -50,7 +56,18 @@ export async function convertImage(
     }
 
     context.drawImage(bitmap, 0, 0)
-    const blob = await canvasBlob(canvas, format, quality)
+    let blob: Blob
+    if (format === "image/jpeg") {
+      blob = await encodeCanvasAsJpeg(canvas, quality, jpegEncoder, jpegContentProfile)
+    } else if (format === "image/avif") {
+      const { encode } = await import("@jsquash/avif")
+      const encoded = await encode(context.getImageData(0, 0, canvas.width, canvas.height), {
+        quality: Math.round(quality * 100),
+      })
+      blob = new Blob([encoded], { type: format })
+    } else {
+      blob = await canvasBlob(canvas, format, quality)
+    }
     const baseName = source.name.replace(/\.[^.]+$/, "")
     const outputName = `${baseName}.${extensions[format]}`
 

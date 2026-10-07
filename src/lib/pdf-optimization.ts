@@ -11,6 +11,7 @@ import {
   decodePDFRawStream,
   type PDFObject,
 } from "pdf-lib"
+import { encodeCanvasAsJpeg, type JpegContentProfile, type JpegEncoder } from "@/lib/jpeg-encoding"
 
 const name = (value: string) => PDFName.of(value)
 const MAX_OPTIMIZABLE_PIXELS = 16_000_000
@@ -488,25 +489,35 @@ export async function loadPdfImageAssets(data: Uint8Array): Promise<PdfImageAsse
   return assets
 }
 
-export async function compressPdfImage(asset: PdfImageAsset, quality: number): Promise<OptimizedPdfImage> {
+export async function compressPdfImage(
+  asset: PdfImageAsset,
+  quality: number,
+  encoder: JpegEncoder,
+  contentProfile: JpegContentProfile,
+  maxPhotoDimension: number | null,
+): Promise<OptimizedPdfImage> {
   if (!asset.canOptimize || !asset.previewUrl) throw new Error("This image cannot be recompressed.")
   const response = await fetch(asset.previewUrl)
   const bitmap = await createImageBitmap(await response.blob())
 
   try {
+    const maximumDimension = contentProfile === "text" || asset.hasSoftMask || maxPhotoDimension === null
+      ? Math.max(bitmap.width, bitmap.height)
+      : maxPhotoDimension
+    const scale = Math.min(1, maximumDimension / Math.max(bitmap.width, bitmap.height))
     const canvas = document.createElement("canvas")
-    canvas.width = bitmap.width
-    canvas.height = bitmap.height
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale))
     const context = canvas.getContext("2d")
     if (!context) throw new Error("Canvas is unavailable in this browser.")
-    context.drawImage(bitmap, 0, 0)
-    const blob = await canvasToBlob(canvas, "image/jpeg", quality / 100)
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+    const blob = await encodeCanvasAsJpeg(canvas, quality / 100, encoder, contentProfile)
     return {
       id: asset.id,
       blob,
       originalBytes: asset.sizeBytes,
-      width: bitmap.width,
-      height: bitmap.height,
+      width: canvas.width,
+      height: canvas.height,
       previewUrl: URL.createObjectURL(blob),
     }
   } finally {
@@ -534,6 +545,8 @@ export async function applyPdfImageOptimizations(file: File, images: OptimizedPd
     dictionary.set(name("Filter"), name("DCTDecode"))
     dictionary.set(name("ColorSpace"), name("DeviceRGB"))
     dictionary.set(name("BitsPerComponent"), PDFNumber.of(8))
+    dictionary.set(name("Width"), PDFNumber.of(image.width))
+    dictionary.set(name("Height"), PDFNumber.of(image.height))
     dictionary.delete(name("DecodeParms"))
     dictionary.delete(name("Decode"))
     const imageBytes = new Uint8Array(await image.blob.arrayBuffer())
