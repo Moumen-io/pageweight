@@ -41,6 +41,12 @@ type ImageRecord = {
   stream: PDFRawStream
 }
 
+type ImageColorSpace = {
+  name: "DeviceRGB" | "DeviceGray" | "ICCBased"
+  channels: 1 | 3
+  iccProfile: Uint8Array | null
+}
+
 function resolve(context: PDFDocument["context"], value?: PDFObject): PDFObject | undefined {
   return value instanceof PDFRef ? context.lookup(value) : value
 }
@@ -57,9 +63,34 @@ function filtersFor(stream: PDFRawStream, context: PDFDocument["context"]) {
   return []
 }
 
-function colorSpaceFor(stream: PDFRawStream, context: PDFDocument["context"]) {
+function colorSpaceFor(stream: PDFRawStream, context: PDFDocument["context"]): ImageColorSpace | null {
   const colorSpace = resolve(context, stream.dict.get(name("ColorSpace")))
-  return colorSpace instanceof PDFName ? colorSpace.decodeText() : null
+  if (colorSpace instanceof PDFName) {
+    const colorSpaceName = colorSpace.decodeText()
+    if (colorSpaceName === "DeviceRGB") return { name: colorSpaceName, channels: 3, iccProfile: null }
+    if (colorSpaceName === "DeviceGray") return { name: colorSpaceName, channels: 1, iccProfile: null }
+    return null
+  }
+
+  if (!(colorSpace instanceof PDFArray)) return null
+  const family = resolve(context, colorSpace.get(0))
+  if (!(family instanceof PDFName) || family.decodeText() !== "ICCBased") return null
+
+  const profile = resolve(context, colorSpace.get(1))
+  if (!(profile instanceof PDFRawStream)) return null
+  const channels = numberFor(profile, "N")
+  if (channels !== 1 && channels !== 3) return null
+
+  try {
+    const iccProfile = decodePDFRawStream(profile).decode()
+    const colorSignature = channels === 1 ? "GRAY" : "RGB "
+    if (iccProfile.length < 128
+      || String.fromCharCode(...iccProfile.subarray(16, 20)) !== colorSignature
+      || String.fromCharCode(...iccProfile.subarray(36, 40)) !== "acsp") return null
+    return { name: "ICCBased", channels, iccProfile }
+  } catch {
+    return null
+  }
 }
 
 function numberFor(stream: PDFRawStream, key: string) {
@@ -175,9 +206,167 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
   })
 }
 
-async function rasterPreview(record: ImageRecord, context: PDFDocument["context"], colorSpace: string) {
+function joinBytes(parts: Uint8Array[]) {
+  const output = new Uint8Array(parts.reduce((length, part) => length + part.length, 0))
+  let offset = 0
+  for (const part of parts) {
+    output.set(part, offset)
+    offset += part.length
+  }
+  return output
+}
+
+const jpegIccIdentifier = new TextEncoder().encode("ICC_PROFILE\0")
+
+function stripJpegIccProfiles(jpeg: Uint8Array) {
+  if (jpeg[0] !== 0xff || jpeg[1] !== 0xd8) throw new Error("Invalid JPEG image data")
+
+  const parts = [jpeg.subarray(0, 2)]
+  let offset = 2
+  while (offset < jpeg.length) {
+    const markerStart = offset
+    if (jpeg[offset] !== 0xff) {
+      parts.push(jpeg.subarray(offset))
+      break
+    }
+
+    while (offset < jpeg.length && jpeg[offset] === 0xff) offset += 1
+    if (offset >= jpeg.length) throw new Error("Invalid JPEG marker")
+    const marker = jpeg[offset]
+    offset += 1
+
+    if (marker === 0xda) {
+      parts.push(jpeg.subarray(markerStart))
+      break
+    }
+
+    if (marker === 0xd8 || marker === 0xd9 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      parts.push(jpeg.subarray(markerStart, offset))
+      continue
+    }
+
+    if (offset + 2 > jpeg.length) throw new Error("Invalid JPEG segment")
+    const segmentLength = (jpeg[offset] << 8) | jpeg[offset + 1]
+    const segmentEnd = offset + segmentLength
+    if (segmentLength < 2 || segmentEnd > jpeg.length) throw new Error("Invalid JPEG segment length")
+
+    const payloadStart = offset + 2
+    const hasIccIdentifier = marker === 0xe2
+      && segmentEnd - payloadStart >= jpegIccIdentifier.length + 2
+      && jpegIccIdentifier.every((byte, index) => jpeg[payloadStart + index] === byte)
+    if (!hasIccIdentifier) parts.push(jpeg.subarray(markerStart, segmentEnd))
+    offset = segmentEnd
+  }
+
+  return joinBytes(parts)
+}
+
+function embedJpegIccProfile(jpeg: Uint8Array, profile: Uint8Array) {
+  const strippedJpeg = stripJpegIccProfiles(jpeg)
+  const maximumChunkSize = 65_519
+  const chunkCount = Math.ceil(profile.length / maximumChunkSize)
+  if (chunkCount < 1 || chunkCount > 255) throw new Error("ICC profile is too large for a JPEG image")
+
+  const profileChunks: Uint8Array[] = []
+  for (let index = 0; index < chunkCount; index += 1) {
+    const start = index * maximumChunkSize
+    const profilePart = profile.subarray(start, Math.min(start + maximumChunkSize, profile.length))
+    const segment = new Uint8Array(18 + profilePart.length)
+    segment[0] = 0xff
+    segment[1] = 0xe2
+    const segmentLength = segment.length - 2
+    segment[2] = segmentLength >>> 8
+    segment[3] = segmentLength & 0xff
+    segment.set(jpegIccIdentifier, 4)
+    segment[16] = index + 1
+    segment[17] = chunkCount
+    segment.set(profilePart, 18)
+    profileChunks.push(segment)
+  }
+
+  return joinBytes([
+    strippedJpeg.subarray(0, 2),
+    ...profileChunks,
+    strippedJpeg.subarray(2),
+  ])
+}
+
+const pngCrcTable = (() => {
+  const table = new Uint32Array(256)
+  for (let index = 0; index < table.length; index += 1) {
+    let value = index
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) === 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1
+    }
+    table[index] = value >>> 0
+  }
+  return table
+})()
+
+function pngCrc(bytes: Uint8Array) {
+  let crc = 0xffffffff
+  for (const byte of bytes) crc = pngCrcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8)
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function createPngChunk(type: string, data: Uint8Array) {
+  const chunk = new Uint8Array(12 + data.length)
+  const view = new DataView(chunk.buffer)
+  view.setUint32(0, data.length)
+  chunk.set(new TextEncoder().encode(type), 4)
+  chunk.set(data, 8)
+  view.setUint32(8 + data.length, pngCrc(chunk.subarray(4, 8 + data.length)))
+  return chunk
+}
+
+async function embedPngIccProfile(pngBlob: Blob, profile: Uint8Array) {
+  if (typeof CompressionStream === "undefined") throw new Error("ICC image previews are not supported in this browser")
+  const profileBuffer = profile.slice().buffer as ArrayBuffer
+  const profileStream = new Blob([profileBuffer]).stream().pipeThrough(new CompressionStream("deflate"))
+  const compressedProfile = new Uint8Array(await new Response(profileStream).arrayBuffer())
+  const profileName = new TextEncoder().encode("PDF-ICC")
+  const profileChunkData = new Uint8Array(profileName.length + 2 + compressedProfile.length)
+  profileChunkData.set(profileName)
+  profileChunkData[profileName.length] = 0
+  profileChunkData[profileName.length + 1] = 0
+  profileChunkData.set(compressedProfile, profileName.length + 2)
+  const iccChunk = createPngChunk("iCCP", profileChunkData)
+
+  const png = new Uint8Array(await pngBlob.arrayBuffer())
+  const signature = [137, 80, 78, 71, 13, 10, 26, 10]
+  if (!signature.every((byte, index) => png[index] === byte)) throw new Error("Invalid PNG preview")
+
+  const parts = [png.subarray(0, 8)]
+  let offset = 8
+  let inserted = false
+  while (offset + 12 <= png.length) {
+    const length = new DataView(png.buffer, png.byteOffset + offset, 4).getUint32(0)
+    const end = offset + length + 12
+    if (end > png.length) throw new Error("Invalid PNG chunk")
+
+    const type = String.fromCharCode(...png.subarray(offset + 4, offset + 8))
+    if (type !== "iCCP" && type !== "sRGB" && type !== "gAMA" && type !== "cHRM") {
+      parts.push(png.subarray(offset, end))
+    }
+    if (type === "IHDR") {
+      parts.push(iccChunk)
+      inserted = true
+    }
+    offset = end
+  }
+
+  if (!inserted || offset !== png.length) throw new Error("Could not attach the PDF color profile to the image preview")
+  const pngBuffer = joinBytes(parts).buffer as ArrayBuffer
+  return new Blob([pngBuffer], { type: "image/png" })
+}
+
+async function rasterPreview(
+  record: ImageRecord,
+  context: PDFDocument["context"],
+  colorSpace: ImageColorSpace,
+) {
   const { width, height } = imageDimensions(record.stream)
-  const channels = colorSpace === "DeviceGray" ? 1 : 3
+  const channels = colorSpace.channels
   const samples = samplesFor(record, context, channels)
   const canvas = document.createElement("canvas")
   canvas.width = width
@@ -222,7 +411,7 @@ function assetReason(
   if (width < 1 || height < 1) return "Image dimensions are missing."
   if (width * height > MAX_OPTIMIZABLE_PIXELS) return "This image is too large to process in this browser."
   if (numberFor(stream, "BitsPerComponent") !== 8) return "Only 8-bit images can be recompressed."
-  if (colorSpace !== "DeviceRGB" && colorSpace !== "DeviceGray") return "Only standard RGB and grayscale images can be recompressed."
+  if (!colorSpace) return "This image uses an unsupported color space or profile."
   if (filters.length > 1 || (filters.length === 1 && filters[0] !== "DCTDecode" && filters[0] !== "FlateDecode")) {
     return "This image encoding is preserved as-is."
   }
@@ -232,7 +421,7 @@ function assetReason(
   if (filters[0] !== "DCTDecode" && ![1, 2, 10, 11, 12, 13, 14, 15].includes(decodeParms.predictor)) {
     return "This image encoding is preserved as-is."
   }
-  if (decodeParms.colors !== null && decodeParms.colors !== (colorSpace === "DeviceGray" ? 1 : 3)) {
+  if (decodeParms.colors !== null && decodeParms.colors !== colorSpace.channels) {
     return "This image encoding is preserved as-is."
   }
   if (decodeParms.columns !== null && decodeParms.columns !== width) return "This image encoding is preserved as-is."
@@ -266,12 +455,17 @@ export async function loadPdfImageAssets(data: Uint8Array): Promise<PdfImageAsse
 
     try {
       if (filters.length === 1 && filters[0] === "DCTDecode") {
-        const bytes = record.stream.contents.slice().buffer as ArrayBuffer
+        const colorSpace = colorSpaceFor(record.stream, context)
+        const jpegBytes = colorSpace?.iccProfile
+          ? embedJpegIccProfile(record.stream.contents, colorSpace.iccProfile)
+          : record.stream.contents
+        const bytes = jpegBytes.slice().buffer as ArrayBuffer
         previewUrl = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }))
       } else if (width > 0 && height > 0 && width * height <= MAX_OPTIMIZABLE_PIXELS) {
         const colorSpace = colorSpaceFor(record.stream, context)
-        if (colorSpace === "DeviceRGB" || colorSpace === "DeviceGray") {
-          const blob = await rasterPreview(record, context, colorSpace)
+        if (colorSpace) {
+          let blob = await rasterPreview(record, context, colorSpace)
+          if (colorSpace.iccProfile) blob = await embedPngIccProfile(blob, colorSpace.iccProfile)
           previewUrl = URL.createObjectURL(blob)
         }
       }
