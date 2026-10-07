@@ -17,6 +17,12 @@ The stream sizes measure the encoded payload inside PDF streams. They do not ass
 
 The asset table can be exported as CSV.
 
+## PDF image optimization
+
+After inspection, supported embedded images are recompressed in the background and their candidate sizes appear beside the encoded sizes in the Asset breakdown table. Expand a row for image details, select which images to include, and use the split preview to compare the original and optimized versions. JPEG quality can be set from 10% to 90%; confirm a changed quality to re-optimize the images before downloading a smaller copy of the PDF. Page text, vector content, image placement, and supported image transparency masks are retained. Rewriting a PDF invalidates existing digital signatures. Processing stays in the browser.
+
+Optimization supports standard 8-bit RGB and grayscale JPEG, Flate, and unfiltered image streams. Other color spaces, encodings, and mask images remain unchanged.
+
 ## Image converter
 
 Select or drop multiple PNG, JPEG, and WebP files to convert them to WebP, JPEG, or PNG. WebP and JPEG quality can be adjusted; converted files can be downloaded individually or as a ZIP archive. JPEG output uses a white background for transparent pixels. Canvas conversion removes embedded metadata.

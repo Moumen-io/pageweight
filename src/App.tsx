@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react"
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react"
 import {
   ArrowDownToLine,
   ArrowLeftRight,
   ArrowRight,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  Eye,
   FileImage,
   FileText,
   Image as ImageIcon,
@@ -19,10 +21,12 @@ import {
 import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist"
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url"
 import type { AssetCategory, PdfAsset, PdfReport } from "@/lib/pdf-analysis"
+import type { OptimizedPdfImage, PdfImageAsset } from "@/lib/pdf-optimization"
 import { convertImage, type ConvertedImage, type OutputFormat } from "@/lib/image-conversion"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Card,
   CardContent,
@@ -39,6 +43,13 @@ import {
   EmptyTitle,
 } from "@/components/ui/empty"
 import { Label } from "@/components/ui/label"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
@@ -129,12 +140,180 @@ function assetIcon(category: AssetCategory) {
   return <ArrowLeftRight aria-hidden="true" />
 }
 
-function AssetTable({ assets, fileSize }: { assets: PdfAsset[]; fileSize: number }) {
+const DEFAULT_JPEG_QUALITY = 74
+
+function AssetTable({
+  assets,
+  file,
+  fileSize,
+  images,
+  imageLoadError,
+  onReplaceDocument,
+}: {
+  assets: PdfAsset[]
+  file: File
+  fileSize: number
+  images: PdfImageAsset[]
+  imageLoadError: string | null
+  onReplaceDocument: (file: File) => void
+}) {
   const [filter, setFilter] = useState<AssetFilter>("all")
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set())
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
+  const [quality, setQuality] = useState(DEFAULT_JPEG_QUALITY)
+  const [draftQuality, setDraftQuality] = useState(DEFAULT_JPEG_QUALITY)
+  const [optimizedImages, setOptimizedImages] = useState<OptimizedPdfImage[]>([])
+  const [isOptimizing, setIsOptimizing] = useState(false)
+  const [isApplying, setIsApplying] = useState(false)
+  const [progress, setProgress] = useState({ completed: 0, total: 0 })
+  const [error, setError] = useState<string | null>(null)
+  const [previewId, setPreviewId] = useState<string | null>(null)
+  const [comparisonPosition, setComparisonPosition] = useState(50)
+  const optimizationRunRef = useRef(0)
+  const ownedPreviewUrlsRef = useRef(new Set<string>())
+
+  const imageById = useMemo(() => new Map(images.map((image) => [image.id, image])), [images])
+  const assetById = useMemo(() => new Map(assets.map((asset) => [asset.id, asset])), [assets])
+  const optimizedById = useMemo(
+    () => new Map(optimizedImages.map((image) => [image.id, image])),
+    [optimizedImages],
+  )
   const filteredAssets = useMemo(
     () => filter === "all" ? assets : assets.filter((asset) => asset.category === filter),
     [assets, filter],
   )
+  const optimizableImages = useMemo(
+    () => images.filter((image) => image.canOptimize && image.previewUrl),
+    [images],
+  )
+  const selectedOptimizedImages = optimizedImages.filter(
+    (image) => selectedIds.has(image.id) && image.blob.size < image.originalBytes,
+  )
+  const selectedSavings = selectedOptimizedImages.reduce(
+    (sum, image) => sum + image.originalBytes - image.blob.size,
+    0,
+  )
+  const allOptimizableSelected = optimizableImages.length > 0
+    && optimizableImages.every((image) => selectedIds.has(image.id))
+  const downloadHint = selectedSavings > 0
+    ? `${formatBytes(selectedSavings)} smaller across selected images`
+    : isOptimizing
+      ? "Updating the selected image estimates"
+      : selectedIds.size === 0
+        ? optimizableImages.length === 0 ? "No supported images to include" : "Select images to include in the PDF"
+        : "No reduction available for this selection at the current quality"
+
+  const clearOptimizedPreviews = useCallback(() => {
+    for (const url of ownedPreviewUrlsRef.current) URL.revokeObjectURL(url)
+    ownedPreviewUrlsRef.current.clear()
+  }, [])
+
+  const optimizeImages = useCallback(async (nextQuality: number) => {
+    const runId = optimizationRunRef.current + 1
+    optimizationRunRef.current = runId
+    clearOptimizedPreviews()
+    setOptimizedImages([])
+    setQuality(nextQuality)
+    setIsOptimizing(optimizableImages.length > 0)
+    setProgress({ completed: 0, total: optimizableImages.length })
+    setError(null)
+    setPreviewId(null)
+
+    if (optimizableImages.length === 0) {
+      setIsOptimizing(false)
+      return
+    }
+
+    let failedCount = 0
+    try {
+      const { compressPdfImage } = await import("@/lib/pdf-optimization")
+      for (const [index, image] of optimizableImages.entries()) {
+        if (optimizationRunRef.current !== runId) return
+        try {
+          const result = await compressPdfImage(image, nextQuality)
+          if (optimizationRunRef.current !== runId) {
+            if (result.previewUrl) URL.revokeObjectURL(result.previewUrl)
+            return
+          }
+          if (result.previewUrl) ownedPreviewUrlsRef.current.add(result.previewUrl)
+          setOptimizedImages((previous) => [...previous.filter((item) => item.id !== result.id), result])
+        } catch {
+          failedCount += 1
+        }
+        if (optimizationRunRef.current === runId) {
+          setProgress({ completed: index + 1, total: optimizableImages.length })
+        }
+      }
+      if (failedCount > 0 && optimizationRunRef.current === runId) {
+        setError(`${failedCount} image${failedCount === 1 ? "" : "s"} could not be prepared. Those streams will stay unchanged.`)
+      }
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "The images could not be optimized in this browser."
+      if (optimizationRunRef.current === runId) setError(message)
+    } finally {
+      if (optimizationRunRef.current === runId) setIsOptimizing(false)
+    }
+  }, [clearOptimizedPreviews, optimizableImages])
+
+  useEffect(() => {
+    setExpandedIds(new Set())
+    setSelectedIds(new Set(optimizableImages.map((image) => image.id)))
+    setDraftQuality(DEFAULT_JPEG_QUALITY)
+    void optimizeImages(DEFAULT_JPEG_QUALITY)
+    return () => {
+      optimizationRunRef.current += 1
+    }
+  }, [images, optimizableImages, optimizeImages])
+
+  useEffect(() => () => clearOptimizedPreviews(), [clearOptimizedPreviews])
+
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((previous) => {
+      const next = new Set(previous)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleSelected = (id: string, checked: boolean) => {
+    setSelectedIds((previous) => {
+      const next = new Set(previous)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
+
+  const selectAllOptimizable = () => {
+    setSelectedIds(allOptimizableSelected
+      ? new Set()
+      : new Set(optimizableImages.map((image) => image.id)))
+  }
+
+  const downloadOptimizedPdf = async () => {
+    if (selectedOptimizedImages.length === 0 || isApplying || isOptimizing) return
+    setIsApplying(true)
+    setError(null)
+    try {
+      const { applyPdfImageOptimizations } = await import("@/lib/pdf-optimization")
+      const optimizedFile = await applyPdfImageOptimizations(file, selectedOptimizedImages)
+      if (optimizedFile.size >= file.size) {
+        throw new Error("The PDF did not shrink overall. Try a lower JPEG quality or select more images.")
+      }
+      downloadBlob(optimizedFile, optimizedFile.name)
+      onReplaceDocument(optimizedFile)
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "The optimized PDF could not be created."
+      setError(message)
+    } finally {
+      setIsApplying(false)
+    }
+  }
+
+  const previewAsset = previewId ? assetById.get(previewId) : undefined
+  const previewImage = previewId ? imageById.get(previewId) : undefined
+  const previewResult = previewId ? optimizedById.get(previewId) : undefined
 
   return (
     <section className="asset-table-panel" aria-labelledby="asset-breakdown-title">
@@ -168,35 +347,141 @@ function AssetTable({ assets, fileSize }: { assets: PdfAsset[]; fileSize: number
         <Table>
           <TableHeader>
             <TableRow>
+              <TableHead className="select-column"><span className="sr-only">Include in optimized PDF</span></TableHead>
               <TableHead>Embedded item</TableHead>
               <TableHead className="page-column">Pages</TableHead>
               <TableHead className="size-column">Encoded size</TableHead>
+              <TableHead className="optimized-column">Optimized</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {filteredAssets.map((asset) => (
-              <TableRow key={asset.id} className="asset-row">
-                <TableCell>
-                  <div className="asset-name-cell">
-                    <span className={cn("asset-type-mark", categoryInfo[asset.category].className)}>
-                      {assetIcon(asset.category)}
-                    </span>
-                    <span className="asset-copy">
-                      <span className="asset-name">{asset.name}</span>
-                      <span className="asset-detail">{asset.detail}</span>
-                    </span>
-                  </div>
-                </TableCell>
-                <TableCell className="page-column page-value">{formatPageList(asset.pages)}</TableCell>
-                <TableCell className="size-column">
-                  <span className="size-value">{formatBytes(asset.sizeBytes)}</span>
-                  <span className="size-share">{((asset.sizeBytes / fileSize) * 100).toFixed(1)}%</span>
-                </TableCell>
-              </TableRow>
-            ))}
+            {filteredAssets.map((asset) => {
+              const image = asset.category === "image" ? imageById.get(asset.id) : undefined
+              const result = optimizedById.get(asset.id)
+              const expanded = expandedIds.has(asset.id)
+              const selected = selectedIds.has(asset.id)
+              const detailsId = `asset-details-${asset.id.replace(/[^a-zA-Z0-9_-]/g, "-")}`
+              const sizeDelta = result && result.originalBytes > 0
+                ? Math.round(((result.blob.size - result.originalBytes) / result.originalBytes) * 100)
+                : null
+
+              return (
+                <Fragment key={asset.id}>
+                  <TableRow className={cn("asset-row", expanded && "is-expanded")}>
+                    <TableCell className="select-column">
+                      {asset.category === "image" && image?.canOptimize && (
+                        <Checkbox
+                          aria-label={`Include ${asset.name} in optimized PDF`}
+                          checked={selected}
+                          disabled={isApplying}
+                          onCheckedChange={(checked) => toggleSelected(asset.id, checked === true)}
+                        />
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <div className="asset-name-cell">
+                        {asset.category === "image" && (
+                          <Button
+                            aria-expanded={expanded}
+                            aria-controls={detailsId}
+                            aria-label={`${expanded ? "Collapse" : "Expand"} ${asset.name}`}
+                            className="asset-expand-trigger"
+                            onClick={() => toggleExpanded(asset.id)}
+                            size="icon-sm"
+                            variant="ghost"
+                          >
+                            <ChevronDown data-icon="inline-start" />
+                          </Button>
+                        )}
+                        <span className={cn("asset-type-mark", categoryInfo[asset.category].className)}>
+                          {assetIcon(asset.category)}
+                        </span>
+                        <span className="asset-copy">
+                          <span className="asset-name">{asset.name}</span>
+                          <span className="asset-detail">{asset.detail}</span>
+                        </span>
+                      </div>
+                    </TableCell>
+                    <TableCell className="page-column page-value">{formatPageList(asset.pages)}</TableCell>
+                    <TableCell className="size-column">
+                      <span className="size-value">{formatBytes(asset.sizeBytes)}</span>
+                      <span className="size-share">{((asset.sizeBytes / fileSize) * 100).toFixed(1)}%</span>
+                    </TableCell>
+                    <TableCell className="optimized-column">
+                      {asset.category !== "image" ? (
+                        <span className="size-muted">—</span>
+                      ) : result ? (
+                        <span className="optimized-size-value">
+                          <strong>{formatBytes(result.blob.size)}</strong>
+                          {sizeDelta !== null && (
+                            <small className={sizeDelta <= 0 ? "is-smaller" : "is-larger"}>
+                              {sizeDelta <= 0 ? `${Math.abs(sizeDelta)}% smaller` : `${sizeDelta}% larger`}
+                            </small>
+                          )}
+                        </span>
+                      ) : image?.canOptimize && isOptimizing ? (
+                        <span className="size-muted">Preparing…</span>
+                      ) : image?.reason ? (
+                        <span className="size-muted" title={image.reason}>Kept as-is</span>
+                      ) : imageLoadError ? (
+                        <span className="size-muted" title={imageLoadError}>Unavailable</span>
+                      ) : (
+                        <span className="size-muted">—</span>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                  {expanded && asset.category === "image" && (
+                    <TableRow className="asset-expanded-row" id={detailsId}>
+                      <TableCell className="asset-expanded-cell" colSpan={5}>
+                        <div className="asset-expanded-content">
+                          <div className="asset-expanded-previews">
+                            <div className="asset-expanded-preview">
+                              <span>Encoded</span>
+                              {image?.previewUrl
+                                ? <img src={image.previewUrl} alt={`Encoded preview of ${asset.name}`} />
+                                : <span className="asset-preview-unavailable"><FileImage aria-hidden="true" /></span>}
+                            </div>
+                            <div className="asset-expanded-preview">
+                              <span>Optimized</span>
+                              {result?.previewUrl
+                                ? <img src={result.previewUrl} alt={`Optimized preview of ${asset.name}`} />
+                                : <span className="asset-preview-unavailable">{isOptimizing ? "Preparing…" : "Not available"}</span>}
+                            </div>
+                          </div>
+                          <div className="asset-expanded-copy">
+                            <p>{image ? `${image.width} × ${image.height} px · ${image.format} source` : imageLoadError ?? "Image data is unavailable for optimization."}</p>
+                            <div className="asset-expanded-sizes">
+                              <span><small>Encoded</small><strong>{formatBytes(asset.sizeBytes)}</strong></span>
+                              <span><small>Optimized at {quality}%</small><strong>{result ? formatBytes(result.blob.size) : isOptimizing && image?.canOptimize ? "Preparing…" : "—"}</strong></span>
+                            </div>
+                            {image?.reason && <p className="asset-optimization-reason">{image.reason}</p>}
+                            {image?.hasSoftMask && <p className="asset-optimization-reason">Transparency is kept in its original soft mask.</p>}
+                            <div className="asset-expanded-actions">
+                              <span>{image?.canOptimize ? "JPEG recompression runs locally in your browser." : "This stream is left unchanged."}</span>
+                              <Button
+                                disabled={!image?.previewUrl || !result?.previewUrl}
+                                onClick={() => {
+                                  setComparisonPosition(50)
+                                  setPreviewId(asset.id)
+                                }}
+                                size="sm"
+                                variant="outline"
+                              >
+                                <Eye data-icon="inline-start" />
+                                Preview
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </Fragment>
+              )
+            })}
             {filteredAssets.length === 0 && (
               <TableRow>
-                <TableCell colSpan={3} className="empty-table-cell">
+                <TableCell colSpan={5} className="empty-table-cell">
                   No stream entries match this filter.
                 </TableCell>
               </TableRow>
@@ -204,7 +489,130 @@ function AssetTable({ assets, fileSize }: { assets: PdfAsset[]; fileSize: number
           </TableBody>
         </Table>
       </ScrollArea>
-      <p className="table-footnote">Sizes are encoded stream bytes. Shared PDF resources are counted once.</p>
+
+      {images.length > 0 && (
+        <div className="asset-optimization-controls">
+          <div className="asset-quality-controls">
+            <div className="quality-heading">
+              <Label htmlFor="pdf-image-quality">JPEG quality</Label>
+              <span>{draftQuality}%</span>
+            </div>
+            <Slider
+              aria-label="PDF image JPEG quality"
+              disabled={isOptimizing || isApplying}
+              id="pdf-image-quality"
+              max={90}
+              min={10}
+              onValueChange={(value) => {
+                const nextValue = Array.isArray(value) ? value[0] : value
+                if (typeof nextValue === "number") setDraftQuality(nextValue)
+              }}
+              step={1}
+              value={[draftQuality]}
+            />
+            <Button
+              disabled={draftQuality === quality || isOptimizing || isApplying || optimizableImages.length === 0}
+              onClick={() => void optimizeImages(draftQuality)}
+              size="sm"
+              variant="outline"
+            >
+              {isOptimizing ? <Spinner data-icon="inline-start" /> : <ArrowRight data-icon="inline-start" />}
+              {isOptimizing ? "Optimizing images" : `Confirm ${draftQuality}%`}
+            </Button>
+            <p>Images are prepared automatically at {quality}% quality. Confirm a new value to re-optimize all supported images. Quality can go down to 10%.</p>
+          </div>
+
+          <div className="asset-optimization-actions">
+            <div className="asset-selection-actions">
+              <span><strong>{selectedIds.size}</strong> selected for the PDF</span>
+              <Button
+                disabled={optimizableImages.length === 0 || isApplying}
+                onClick={selectAllOptimizable}
+                size="sm"
+                variant="ghost"
+              >
+                {allOptimizableSelected ? "Clear selection" : "Select all"}
+              </Button>
+            </div>
+            <div className="asset-download-actions">
+              <span>{downloadHint}</span>
+              <Button
+                disabled={selectedOptimizedImages.length === 0 || isOptimizing || isApplying}
+                onClick={() => void downloadOptimizedPdf()}
+                size="lg"
+              >
+                {isApplying ? <Spinner data-icon="inline-start" /> : <ArrowDownToLine data-icon="inline-start" />}
+                {isApplying ? "Building PDF" : "Download optimized PDF"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isOptimizing && progress.total > 0 && (
+        <div className="conversion-progress optimization-progress">
+          <div className="progress-copy"><span>Optimizing supported images in the background</span><span>{progress.completed} / {progress.total}</span></div>
+          <Progress value={(progress.completed / progress.total) * 100} />
+        </div>
+      )}
+      {error && (
+        <Alert variant="destructive" className="optimization-error">
+          <CircleAlert aria-hidden="true" />
+          <AlertTitle>Image optimization needs attention</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+      <p className="table-footnote">Sizes are encoded stream bytes. Shared PDF resources are counted once. Unsupported image encodings remain unchanged.</p>
+
+      <Dialog open={previewId !== null} onOpenChange={(open) => { if (!open) setPreviewId(null) }}>
+        <DialogContent className="image-compare-dialog">
+          <DialogHeader>
+            <DialogTitle>{previewAsset?.name ?? "Image comparison"}</DialogTitle>
+            <DialogDescription>
+              Compare the encoded source with its JPEG recompression at {quality}% quality.
+            </DialogDescription>
+          </DialogHeader>
+          {previewImage?.previewUrl && previewResult?.previewUrl && (
+            <>
+              <div className="image-compare-stage">
+                <img className="image-compare-optimized" src={previewResult.previewUrl} alt="Optimized image" />
+                <div
+                  className="image-compare-original-clip"
+                  style={{ clipPath: `inset(0 ${100 - comparisonPosition}% 0 0)` }}
+                >
+                  <img src={previewImage.previewUrl} alt="Original encoded image" />
+                </div>
+                <div className="image-compare-divider" style={{ left: `${comparisonPosition}%` }} aria-hidden="true" />
+                <span className="image-compare-label image-compare-label-before">Original</span>
+                <span className="image-compare-label image-compare-label-after">Optimized</span>
+              </div>
+              <div className="image-compare-control">
+                <div className="quality-heading">
+                  <Label htmlFor="image-compare-position">Before / after split</Label>
+                  <span>{comparisonPosition}%</span>
+                </div>
+                <Slider
+                  aria-label="Original and optimized image split position"
+                  id="image-compare-position"
+                  max={100}
+                  min={0}
+                  onValueChange={(value) => {
+                    const nextValue = Array.isArray(value) ? value[0] : value
+                    if (typeof nextValue === "number") setComparisonPosition(nextValue)
+                  }}
+                  step={1}
+                  value={[comparisonPosition]}
+                />
+              </div>
+              <div className="image-compare-sizes">
+                <span><small>Encoded</small><strong>{formatBytes(previewImage.sizeBytes)}</strong></span>
+                <span><small>Optimized</small><strong>{formatBytes(previewResult.blob.size)}</strong></span>
+                <span><small>At quality</small><strong>{quality}%</strong></span>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </section>
   )
 }
@@ -320,6 +728,9 @@ function PdfWorkspace({
   report,
   previewDocument,
   previewError,
+  imageAssets,
+  imageLoadError,
+  onReplaceDocument,
   isAnalyzing,
   error,
   onPickFile,
@@ -330,6 +741,9 @@ function PdfWorkspace({
   report: PdfReport | null
   previewDocument: PDFDocumentProxy | null
   previewError: string | null
+  imageAssets: PdfImageAsset[]
+  imageLoadError: string | null
+  onReplaceDocument: (file: File) => void
   isAnalyzing: boolean
   error: string | null
   onPickFile: () => void
@@ -514,7 +928,14 @@ function PdfWorkspace({
       </section>
 
       <div className="asset-workspace">
-        <AssetTable assets={report.assets} fileSize={file.size} />
+        <AssetTable
+          assets={report.assets}
+          file={file}
+          fileSize={file.size}
+          imageLoadError={imageLoadError}
+          images={imageAssets}
+          onReplaceDocument={onReplaceDocument}
+        />
         <aside className="inspector-aside">
           <PdfPreview
             document={previewDocument}
@@ -739,7 +1160,7 @@ function ImageConverter() {
                 disabled={format === "image/png"}
                 id="image-quality"
                 max={100}
-                min={40}
+                min={10}
                 onValueChange={(value) => {
                   const nextQuality = Array.isArray(value) ? value[0] : value
                   if (typeof nextQuality === "number") {
@@ -881,6 +1302,8 @@ function App() {
   const [tool, setTool] = useState<ToolMode>("inspect")
   const [pdfFile, setPdfFile] = useState<File | null>(null)
   const [pdfReport, setPdfReport] = useState<PdfReport | null>(null)
+  const [pdfImageAssets, setPdfImageAssets] = useState<PdfImageAsset[]>([])
+  const [pdfImageError, setPdfImageError] = useState<string | null>(null)
   const [previewDocument, setPreviewDocument] = useState<PDFDocumentProxy | null>(null)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [pdfError, setPdfError] = useState<string | null>(null)
@@ -889,6 +1312,12 @@ function App() {
   useEffect(() => () => {
     void previewTaskRef.current?.destroy()
   }, [])
+
+  useEffect(() => () => {
+    pdfImageAssets.forEach((asset) => {
+      if (asset.previewUrl) URL.revokeObjectURL(asset.previewUrl)
+    })
+  }, [pdfImageAssets])
 
   const inspectFile = useCallback(async (file: File) => {
     const runId = analysisRunRef.current + 1
@@ -901,6 +1330,8 @@ function App() {
       setPdfError("Choose a file with a .pdf extension.")
       setPdfFile(null)
       setPdfReport(null)
+      setPdfImageAssets([])
+      setPdfImageError(null)
       setPreviewDocument(null)
       setIsAnalyzing(false)
       return
@@ -908,6 +1339,8 @@ function App() {
 
     setPdfFile(file)
     setPdfReport(null)
+    setPdfImageAssets([])
+    setPdfImageError(null)
     setPdfError(null)
     setPreviewError(null)
     setPreviewDocument(null)
@@ -917,30 +1350,44 @@ function App() {
       const buffer = await file.arrayBuffer()
       const streamData = new Uint8Array(buffer.slice(0))
       const previewData = new Uint8Array(buffer.slice(0))
-      const [{ analyzePdf }, pdfjs] = await Promise.all([
+      const [{ analyzePdf }, { loadPdfImageAssets }, pdfjs] = await Promise.all([
         import("@/lib/pdf-analysis"),
+        import("@/lib/pdf-optimization"),
         import("pdfjs-dist"),
       ])
       pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
       const previewTask = pdfjs.getDocument({ data: previewData })
       previewTaskRef.current = previewTask
-      const [analysisResult, previewResult] = await Promise.allSettled([
+      const [analysisResult, previewResult, imageResult] = await Promise.allSettled([
         analyzePdf(streamData, file.size),
         previewTask.promise,
+        loadPdfImageAssets(new Uint8Array(buffer.slice(0))),
       ])
 
       if (runId !== analysisRunRef.current) {
         if (previewTaskRef.current === previewTask) previewTaskRef.current = null
         void previewTask.destroy()
+        if (imageResult.status === "fulfilled") {
+          imageResult.value.forEach((asset) => {
+            if (asset.previewUrl) URL.revokeObjectURL(asset.previewUrl)
+          })
+        }
         return
       }
 
       if (analysisResult.status === "rejected") {
         if (previewTaskRef.current === previewTask) previewTaskRef.current = null
         void previewTask.destroy()
+        if (imageResult.status === "fulfilled") {
+          imageResult.value.forEach((asset) => {
+            if (asset.previewUrl) URL.revokeObjectURL(asset.previewUrl)
+          })
+        }
         throw analysisResult.reason
       }
       setPdfReport(analysisResult.value)
+      if (imageResult.status === "fulfilled") setPdfImageAssets(imageResult.value)
+      else setPdfImageError("The image previews could not be prepared for this PDF.")
 
       if (previewResult.status === "fulfilled") setPreviewDocument(previewResult.value)
       else {
@@ -953,6 +1400,7 @@ function App() {
         setPdfError(friendlyError(error))
         setPdfFile(null)
         setPdfReport(null)
+        setPdfImageAssets([])
       }
     } finally {
       if (runId === analysisRunRef.current) setIsAnalyzing(false)
@@ -991,7 +1439,7 @@ function App() {
           <div className="page-heading-copy">
             <p className="eyebrow">LOCAL PDF TOOLS <span>/</span> 01</p>
             <h1>PDF asset inspector</h1>
-            <p>See which embedded streams account for document size, then convert images before your next export.</p>
+            <p>Inspect embedded streams, preview images, and reduce image size directly in a copy of the PDF.</p>
           </div>
           <div className="page-heading-mark" aria-hidden="true"><ScanSearch /></div>
         </div>
@@ -1020,10 +1468,13 @@ function App() {
             <PdfWorkspace
               error={pdfError}
               file={pdfFile}
+              imageAssets={pdfImageAssets}
+              imageLoadError={pdfImageError}
               isAnalyzing={isAnalyzing}
               onDropFile={(file) => void inspectFile(file)}
               onExport={exportCsv}
               onPickFile={() => pdfInputRef.current?.click()}
+              onReplaceDocument={(file) => void inspectFile(file)}
               previewDocument={previewDocument}
               previewError={previewError}
               report={pdfReport}
