@@ -75,10 +75,34 @@ function imageFormat(filters: string[]) {
   return filters[0]?.replace("Decode", "") ?? "Unfiltered"
 }
 
-function imageDetail(stream: PDFRawStream, filters: string[]) {
+function readColorSpace(stream: PDFRawStream, resolve: (value?: PDFObject) => PDFObject | undefined) {
+  const colorSpace = resolve(stream.dict.get(pdfName("ColorSpace")))
+
+  if (colorSpace instanceof PDFName) return colorSpace.decodeText()
+  if (colorSpace instanceof PDFArray) {
+    const family = resolve(colorSpace.get(0))
+    if (!(family instanceof PDFName)) return undefined
+
+    const familyName = family.decodeText()
+    if (familyName === "Indexed" || familyName === "I") {
+      const base = resolve(colorSpace.get(1))
+      if (base instanceof PDFName) return `${familyName} ${base.decodeText()}`
+    }
+
+    return familyName
+  }
+
+  return undefined
+}
+
+function imageDetail(
+  stream: PDFRawStream,
+  filters: string[],
+  resolve: (value?: PDFObject) => PDFObject | undefined,
+) {
   const width = readNumber(stream.dict, "Width")
   const height = readNumber(stream.dict, "Height")
-  const colorSpace = readName(stream.dict, "ColorSpace")
+  const colorSpace = readColorSpace(stream, resolve)
   const bitDepth = readNumber(stream.dict, "BitsPerComponent")
   const parts = [imageFormat(filters)]
 
@@ -265,7 +289,7 @@ export async function analyzePdf(data: Uint8Array, fileSize: number): Promise<Pd
         id: record.id,
         name: `${name.startsWith("/") ? name : `Image ${index + 1}`} · ${record.id.replace(/ R$/, "")}`,
         category: "image",
-        detail: imageDetail(record.stream, filters),
+        detail: imageDetail(record.stream, filters, resolve),
         sizeBytes: record.stream.getContentsSize(),
         pages: Array.from(record.pages).sort((a, b) => a - b),
       }
